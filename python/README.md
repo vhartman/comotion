@@ -9,9 +9,11 @@ concurrently from multiple threads.
 
 ## Install
 
-Install a C++17 compiler, CMake, Eigen3, libccd, and FCL development packages.
-Clone this repository recursively, then run `python -m pip install .` at its root.
-Compilation uses one job by default. No extension is written into a downstream
+Install a C++17 compiler, CMake, Eigen3, libccd, FCL (which also pulls in octomap)
+and the Boost headers (Boost.Serialization, Boost.PropertyTree); on Ubuntu:
+`libeigen3-dev libccd-dev libfcl-dev libboost-dev`. The Python bindings are on the
+branch `vh/experimental/mrmg`. Clone it recursively, then run `python -m pip install .`
+at its root. Compilation uses one job by default; `-Cbuild.tool-args=-j8` parallelizes it. No extension is written into a downstream
 project and no simulator is required at runtime.
 
 The default build targets the local CPU. Rebuild on a different CPU, or choose

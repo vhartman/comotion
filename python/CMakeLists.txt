@@ -37,6 +37,14 @@ comotion_python_module(_primitive)
 target_link_libraries(_primitive PRIVATE PkgConfig::CCD)
 if(COMOTION_PYTHON_ROBOT_SCENES)
   pkg_check_modules(FCL REQUIRED IMPORTED_TARGET fcl)
+  # Some fcl.pc files (e.g. nix) add -std=c++11 to every consumer; the bindings need C++17.
+  get_target_property(_fcl_options PkgConfig::FCL INTERFACE_COMPILE_OPTIONS)
+  if(_fcl_options)
+    list(FILTER _fcl_options EXCLUDE REGEX "^-std=")
+    set_target_properties(PkgConfig::FCL PROPERTIES INTERFACE_COMPILE_OPTIONS "${_fcl_options}")
+  endif()
+  # Path.h and RobotModel.cpp use Boost.Serialization and Boost.PropertyTree headers.
+  find_package(Boost CONFIG REQUIRED)
   set(_src "${PROJECT_SOURCE_DIR}/src/comotion")
   pybind11_add_module(_collision NO_EXTRAS src/bindings.cpp
     "${_src}/robot/RobotModel.cpp"
@@ -45,7 +53,7 @@ if(COMOTION_PYTHON_ROBOT_SCENES)
     "${_src}/collision/FclCollisionBackend.cpp"
     "${_src}/collision/VampCollisionBackend.cpp")
   comotion_python_module(_collision)
-  target_link_libraries(_collision PRIVATE PkgConfig::FCL)
+  target_link_libraries(_collision PRIVATE PkgConfig::FCL Boost::headers)
   target_compile_definitions(_collision PRIVATE COMOTION_HAVE_VAMP=1
     EIGEN_MAX_ALIGN_BYTES=16 EIGEN_MAX_STATIC_ALIGN_BYTES=16)
 endif()
