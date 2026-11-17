@@ -100,6 +100,8 @@ bool Scene::valid_q(const double *q) const {
 }
 
 bool Scene::pair_valid(int a, int b, const std::vector<Pose<double>> &g) const {
+  if (kinds[a] == 1 && kinds[b] == 1) // exact; MPR overestimates elongated pairs
+    return clearance<double>(a, b, g) >= 0;
   if (convex_pair(a, b))
     return clearance<double>(a, b, g) > 0 || (convex_depth(a, b, g) <= 0);
   if (kinds[a] != 2 || kinds[b] != 2)
@@ -135,6 +137,8 @@ bool Scene::pair_valid(int a, int b, const std::vector<Pose<double>> &g) const {
 
 double Scene::pair_depth(int a, int b,
                          const std::vector<Pose<double>> &g) const {
+  if (kinds[a] == 1 && kinds[b] == 1) // exact; MPR overestimates elongated pairs
+    return std::max(0., -clearance<double>(a, b, g));
   if (convex_pair(a, b))
     return clearance<double>(a, b, g) > 0 ? 0. : convex_depth(a, b, g);
   const auto &A = g[a].m;

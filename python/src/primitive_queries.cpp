@@ -168,6 +168,18 @@ py::array_t<bool> Scene::batch_impl(Array qs, std::shared_ptr<Mode> m,
         if (profiling)
           ++pair_count;
         V gap = clearance<V>(a, b, g);
+        // Capsule pairs have an exact clearance, so lanes outside a float
+        // rounding band (bounded like the block bounds above) are decided
+        // here; only the band goes to the double-precision check.
+        bool capsules = kinds[a] == 1 && kinds[b] == 1;
+        V band = V(1e-5f);
+        if (capsules) {
+          const auto &PA = g[a].m, &PB = g[b].m;
+          band = V(1e-4) * (V(1) + V(sizes[a][1] + sizes[b][1]) +
+                            absolute(PA[3]) + absolute(PA[7]) +
+                            absolute(PA[11]) + absolute(PB[3]) +
+                            absolute(PB[7]) + absolute(PB[11]));
+        }
         double threshold = -tolerance;
         if (kinds[a] == 0 || kinds[b] == 0) {
           int sphere = kinds[a] == 0 ? a : b, other = kinds[a] == 0 ? b : a;
@@ -177,12 +189,14 @@ py::array_t<bool> Scene::batch_impl(Array qs, std::shared_ptr<Mode> m,
           double t = std::min(tolerance, radius);
           threshold = -t * (2 * radius - t);
         }
-        if (!convex_pair(a, b)) {
+        if (!convex_pair(a, b) || capsules) {
           // Round the rejection threshold down; boundary lanes go to the
           // double-precision check instead of relying on a float conversion.
           float reject = std::nextafter(
               float(threshold - 1e-5), -std::numeric_limits<float>::infinity());
-          V colliding = (gap < V(reject)) & alive;
+          V colliding = (capsules ? (gap < V(float(-tolerance)) - band)
+                                  : (gap < V(reject))) &
+                        alive;
           if (stop_on_collision && colliding.any()) {
             result[0] = false;
             return out;
@@ -193,7 +207,7 @@ py::array_t<bool> Scene::batch_impl(Array qs, std::shared_ptr<Mode> m,
           any_valid = false;
           break;
         }
-        V uncertain = (gap <= V(1e-5f)) & alive;
+        V uncertain = (gap <= band) & alive;
         if (uncertain.any()) {
           uncertain.to_array_unaligned(flags.data());
           for (int k = 0; k < rows; ++k)

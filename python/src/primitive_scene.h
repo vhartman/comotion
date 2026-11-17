@@ -1,6 +1,7 @@
 #pragma once
 // Frozen articulated sphere/box scenes. SIMD over configurations; no FCL.
 #include <Eigen/Geometry>
+#include <algorithm>
 #include <array>
 #include <ccd/ccd.h>
 #include <chrono>
@@ -73,6 +74,37 @@ inline double maximum(double x, double y) { return std::max(x, y); }
 inline V maximum(V x, V y) { return x.max(y); }
 inline double root(double x) { return std::sqrt(x); }
 inline V root(V x) { return x.sqrt(); }
+inline double clamp01(double x) { return std::min(std::max(x, 0.), 1.); }
+inline V clamp01(V x) { return x.clamp(0.f, 1.f); }
+
+// Exact capsule-capsule clearance: distance between the core segments (local
+// z, half-lengths h) minus the radii; positive means disjoint. Clamps only, no
+// branches, so it runs per SIMD lane. The alternation after the closed-form s
+// makes it exact, including parallel and zero-length cores.
+template <class T>
+T capsule_gap(const std::array<T, 12> &A, double ra, double ha,
+              const std::array<T, 12> &B, double rb, double hb) {
+  std::array<T, 3> d1, d2, r;
+  for (int i = 0; i < 3; ++i) {
+    d1[i] = T(2 * ha) * A[4 * i + 2];
+    d2[i] = T(2 * hb) * B[4 * i + 2];
+    r[i] = (A[4 * i + 3] - T(ha) * A[4 * i + 2]) -
+           (B[4 * i + 3] - T(hb) * B[4 * i + 2]);
+  }
+  auto dot = [](const std::array<T, 3> &x, const std::array<T, 3> &y) {
+    return x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
+  };
+  T a = dot(d1, d1), e = dot(d2, d2), b = dot(d1, d2), c = dot(d1, r),
+    f = dot(d2, r), tiny = T(1e-30);
+  T ai = maximum(a, tiny), ei = maximum(e, tiny);
+  T s = clamp01((b * f - c * e) / maximum(a * e - b * b, tiny));
+  T t = clamp01((b * s + f) / ei);
+  s = clamp01((b * t - c) / ai);
+  t = clamp01((b * s + f) / ei);
+  T w0 = r[0] + s * d1[0] - t * d2[0], w1 = r[1] + s * d1[1] - t * d2[1],
+    w2 = r[2] + s * d1[2] - t * d2[2];
+  return root(w0 * w0 + w1 * w1 + w2 * w2) - T(ra + rb);
+}
 struct Joint {
   int frame, kind;
   Eigen::Vector3d axis;
@@ -228,6 +260,9 @@ class Scene {
       }
       return sum - T(sizes[s][0] * sizes[s][0]);
     }
+    if (kinds[a] == 1 && kinds[b] == 1)
+      return capsule_gap<T>(A, sizes[a][0], sizes[a][1], B, sizes[b][0],
+                            sizes[b][1]);
     T best = T(-1e30);
     auto axis = [&](std::array<T, 3> v) {
       T length =

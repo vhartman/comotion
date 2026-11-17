@@ -2,10 +2,12 @@
 // Optional Panda fast path. Keep upstream self/environment predicates intact;
 // reuse VAMP FK across inter-robot pairs, and pack independent state proposals.
 // No worker threads, changed collision geometry, or relaxed collision tests.
+#include <algorithm>
 #include <chrono>
 #include <comotion/collision/CollisionChecker.h>
 #include <comotion/collision/detail/VampPackingUtils.h>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <numeric>
@@ -18,10 +20,67 @@ namespace comotion_python {
 constexpr std::size_t width = vamp::FloatVectorWidth;
 constexpr std::size_t max_spheres =
     std::max(vamp::robots::Panda::n_spheres, vamp::robots::UR5::n_spheres);
+// Spheres are grouped in runs of group_size consecutive indices (VAMP's
+// generated models list them link by link, so a run is spatially compact).
+// Any grouping is exact; compact groups only make the culling effective.
+constexpr std::size_t group_size = 8;
+constexpr std::size_t max_groups = (max_spheres + group_size - 1) / group_size;
+using Box = std::array<vamp::FloatVector<width>, 3>;
 struct Geometry {
   std::array<vamp::FloatVector<width>, max_spheres> x, y, z, r;
   std::size_t count = 0;
+  // Per-lane bounding boxes, of all spheres and of each group:
+  // hi = max(c + r), nlo = max(r - c), i.e. the box is [-nlo, hi] per axis.
+  Box hi, nlo;
+  std::size_t groups = 0;
+  std::array<Box, max_groups> ghi, gnlo;
 };
+
+// True if two boxes are more than 1e-5 m apart in every lane, so no sphere
+// pair inside them can collide in any lane. The margin keeps float rounding
+// from ever skipping a pair the sphere test would report.
+inline bool boxes_apart(const Box &ahi, const Box &anlo, const Box &bhi,
+                        const Box &bnlo) {
+  auto apart = vamp::FloatVector<width>::zero_vector() < 0.f;
+  for (int d = 0; d < 3; ++d)
+    apart = apart | (ahi[d] + bnlo[d] < -1e-5f) | (bhi[d] + anlo[d] < -1e-5f);
+  return apart.all();
+}
+
+inline bool separated(const Geometry &a, const Geometry &b) {
+  return boxes_apart(a.hi, a.nlo, b.hi, b.nlo);
+}
+
+// Per-lane collision mask over all sphere pairs of two robots. Group pairs
+// whose boxes are apart in every lane are skipped: they cannot contribute.
+// Stops once the mask is decided (any lane if stop_on_any, else all lanes);
+// callers then make the same decision as with the complete mask.
+inline vamp::FloatVector<width> sphere_mask(const Geometry &a,
+                                            const Geometry &b,
+                                            bool stop_on_any,
+                                            std::size_t *tested = nullptr) {
+  auto mask = vamp::FloatVector<width>::zero_vector();
+  for (std::size_t ga = 0; ga < a.groups; ++ga) {
+    const std::size_t u0 = ga * group_size,
+                      u1 = std::min(a.count, u0 + group_size);
+    for (std::size_t gb = 0; gb < b.groups; ++gb) {
+      if (boxes_apart(a.ghi[ga], a.gnlo[ga], b.ghi[gb], b.gnlo[gb]))
+        continue;
+      const std::size_t v0 = gb * group_size,
+                        v1 = std::min(b.count, v0 + group_size);
+      for (std::size_t u = u0; u < u1; ++u)
+        for (std::size_t v = v0; v < v1; ++v)
+          mask = mask | (vamp::collision::sphere_sphere_sql2(
+                             a.x[u], a.y[u], a.z[u], a.r[u], b.x[v], b.y[v],
+                             b.z[v], b.r[v]) < 0.f);
+      if (tested)
+        *tested += (u1 - u0) * (v1 - v0);
+      if (stop_on_any ? mask.any() : mask.all())
+        return mask;
+    }
+  }
+  return mask;
+}
 using Paths = std::vector<comotion::Path>;
 using Robots = std::vector<const comotion::RobotModel *>;
 
@@ -56,6 +115,22 @@ inline Geometry robot_geometry(const comotion::RobotModel &model,
     out.y[k] = r(1, 0) * x + r(1, 1) * y + r(1, 2) * z + t[1];
     out.z[k] = r(2, 0) * x + r(2, 1) * y + r(2, 2) * z + t[2];
   }
+  out.groups = (Robot::n_spheres + group_size - 1) / group_size;
+  for (int d = 0; d < 3; ++d) {
+    const auto &c = d == 0 ? out.x : (d == 1 ? out.y : out.z);
+    for (std::size_t g = 0; g < out.groups; ++g) {
+      const std::size_t k0 = g * group_size,
+                        k1 = std::min(Robot::n_spheres, k0 + group_size);
+      out.ghi[g][d] = c[k0] + out.r[k0];
+      out.gnlo[g][d] = out.r[k0] - c[k0];
+      for (std::size_t k = k0 + 1; k < k1; ++k) {
+        out.ghi[g][d] = out.ghi[g][d].max(c[k] + out.r[k]);
+        out.gnlo[g][d] = out.gnlo[g][d].max(out.r[k] - c[k]);
+      }
+      out.hi[d] = g == 0 ? out.ghi[g][d] : out.hi[d].max(out.ghi[g][d]);
+      out.nlo[d] = g == 0 ? out.gnlo[g][d] : out.nlo[d].max(out.gnlo[g][d]);
+    }
+  }
   return out;
 }
 
@@ -86,22 +161,23 @@ inline bool pairs(const Robots &robots, const Paths &paths,
     for (std::size_t j = i + 1; j < robots.size(); ++j) {
       const auto &a = get(i);
       const auto &b = get(j);
-      std::array<bool, width> colliding{};
-      for (std::size_t u = 0; u < a.count; ++u)
-        for (std::size_t v = 0; v < b.count; ++v) {
-          auto distances = vamp::collision::sphere_sphere_sql2(
-              a.x[u], a.y[u], a.z[u], a.r[u], b.x[v], b.y[v], b.z[v], b.r[v]);
-          std::array<float, width> values{};
-          distances.to_array_unaligned(values.data());
-          for (std::size_t lane = 0; lane < rows.size(); ++lane)
-            if (values[lane] < 0.f)
-              colliding[lane] = true;
-        }
+      // Accumulate the per-lane collision mask in SIMD and read it once per
+      // robot pair (as edge_pairs does), instead of extracting every sphere
+      // pair's lanes. Padding lanes duplicate lane 0, so any()/all() over the
+      // whole vector equal any/all over the real lanes. Same sphere tests and
+      // decisions as before.
+      if (separated(a, b))
+        continue;
+      const auto mask = sphere_mask(a, b, require_all);
+      if (require_all && mask.any())
+        return false;
+      std::array<float, width> lanes{};
+      mask.to_array_unaligned(lanes.data());
       bool any = false;
       for (std::size_t lane = 0; lane < rows.size(); ++lane) {
-        if (require_all && colliding[lane])
-          return false;
-        if (colliding[lane])
+        std::uint32_t bits;
+        std::memcpy(&bits, &lanes[lane], sizeof bits);
+        if (bits)
           valid[rows[lane]] = false;
         any = any || valid[rows[lane]];
       }
@@ -244,6 +320,27 @@ inline bool edge_pairs(const Robots &robots, EdgeWorkspace &work,
         ++stats.robot_pairs;
       const auto &a = work.cache[i];
       const auto &b = work.cache[j];
+      if constexpr (Kernel >= 1) {
+        // Same decisions as the full scan: culled robot / group pairs cannot
+        // collide; kernels 2 and 3 stop at the first collision as before.
+        if (separated(a, b)) {
+          charge<Profile>(stats.pair_seconds, begin);
+          continue;
+        }
+        std::size_t tested = 0;
+        const bool hit = sphere_mask(a, b, Kernel >= 2,
+                                     Profile ? &tested : nullptr)
+                             .any();
+        if constexpr (Profile)
+          stats.sphere_pairs += tested;
+        charge<Profile>(stats.pair_seconds, begin);
+        if (hit) {
+          if constexpr (Profile)
+            ++stats.pair_rejections;
+          return false;
+        }
+        continue;
+      }
       auto mask = vamp::FloatVector<width>::zero_vector();
       std::array<bool, width> colliding{};
       for (std::size_t u = 0; u < a.count; ++u) {
