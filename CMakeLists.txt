@@ -27,6 +27,16 @@ option(COMOTION_BUILD_TESTS "Build CoMotion regression tests"
 option(COMOTION_FETCH_NLOHMANN_JSON
   "Fetch nlohmann/json if it is not available as a CMake package" ON)
 
+option(COMOTION_BUILD_PYTHON "Build the optional Python collision package" OFF)
+option(COMOTION_COLLISION_ONLY "Build Python collision checking without planners" OFF)
+if(COMOTION_COLLISION_ONLY)
+  if(NOT COMOTION_BUILD_PYTHON)
+    message(FATAL_ERROR "COMOTION_COLLISION_ONLY requires COMOTION_BUILD_PYTHON")
+  endif()
+  add_subdirectory(python)
+  return()
+endif()
+
 # ---------------------------------------------------------------------------
 # Third-party: nlohmann/json
 # ---------------------------------------------------------------------------
@@ -377,3 +387,7 @@ set(CPACK_SOURCE_IGNORE_FILES
   "~$"
 )
 include(CPack)
+
+if(COMOTION_BUILD_PYTHON)
+  add_subdirectory(python)
+endif()

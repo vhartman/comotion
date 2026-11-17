@@ -1,0 +1,23 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.13,<3"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "comotion-collision"
+version = "0.1.0"
+description = "CoMotion collision queries for Python planners"
+readme = "python/README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+dependencies = ["numpy>=1.23"]
+
+[tool.scikit-build]
+wheel.packages = ["python/comotion"]
+build.tool-args = ["-j1"]
+cmake.version = ">=3.16"
+sdist.exclude = ["external/como-ompl/doc/**", "external/como-ompl/tests/**", "external/como-ompl/external/vamp/resources/**", "benchmarks/**", "viewer/**"]
+sdist.include = ["external/como-ompl/external/vamp/src/**", "external/como-ompl/external/vamp/cmake/**", "external/como-ompl/external/vamp/CMakeLists.txt", "external/como-ompl/external/vamp/LICENSE*"]
+
+[tool.scikit-build.cmake.define]
+COMOTION_BUILD_PYTHON = "ON"
+COMOTION_COLLISION_ONLY = "ON"
