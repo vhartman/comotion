@@ -29,6 +29,12 @@ function(comotion_python_module target)
   target_compile_options(${target} PRIVATE ${_arch_flags} -Wno-ignored-attributes)
   install(TARGETS ${target} LIBRARY DESTINATION comotion)
 endfunction()
+pybind11_add_module(_primitive NO_EXTRAS
+  src/primitive_scene.cpp src/primitive_geometry.cpp src/primitive_queries.cpp)
+# Keep the collision kernels in one translation unit for cross-function inlining.
+set_target_properties(_primitive PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 0)
+comotion_python_module(_primitive)
+target_link_libraries(_primitive PRIVATE PkgConfig::CCD)
 if(COMOTION_PYTHON_ROBOT_SCENES)
   pkg_check_modules(FCL REQUIRED IMPORTED_TARGET fcl)
   set(_src "${PROJECT_SOURCE_DIR}/src/comotion")
