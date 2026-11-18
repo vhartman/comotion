@@ -1,5 +1,7 @@
 // Optional collision-only bridge. No planner, sampler or cost implementation.
 #include "cached_vamp.h"
+#include "edge_grid.h"
+#include "edge_batch.h"
 #include "runtime_spheres.h"
 #include <algorithm>
 #include <cmath>
@@ -365,6 +367,90 @@ public:
     }
     return result;
   }
+  static void check_query(const py::object &mode, double tolerance) {
+    if (!mode.is_none())
+      throw std::invalid_argument("Generated scene expects its initial (None) mode");
+    if (tolerance != 0.)
+      throw std::invalid_argument("Generated scene supports zero collision tolerance only");
+  }
+  bool state_valid(const Array &q, const py::object &mode,
+                   const std::vector<int> &group, double tolerance) const {
+    check_query(mode, tolerance);
+    return group.empty() ? valid(q) : group_valid(q, group, false);
+  }
+  py::array_t<bool> query_batch(const Array &qs, const py::object &mode,
+                               const std::vector<int> &group, bool simd,
+                               double tolerance) const {
+    check_query(mode, tolerance);
+    if (group.empty() && simd) return batch_valid(qs);
+    if (qs.ndim() != 2 || std::size_t(qs.shape(1)) != offsets_.back())
+      throw std::invalid_argument("Expected (batch,dof)");
+    py::array_t<bool> out(qs.shape(0));
+    for (py::ssize_t i = 0; i < qs.shape(0); ++i) {
+      Array row({qs.shape(1)}, qs.data(i), qs);
+      out.mutable_data()[i] = state_valid(row, mode, group, tolerance);
+    }
+    return out;
+  }
+  std::tuple<bool, int, int> edge_valid(
+      const Array &a, const Array &b, const py::object &mode, int n, int begin,
+      int end, bool endpoints, double tolerance, const std::string &packing,
+      bool early_exit) const {
+    check_query(mode, tolerance);
+    shape(a); shape(b);
+    // Use the same low-level slice semantics as PrimitiveScene.
+    begin = std::clamp(begin < 0 ? n + begin : begin, 0, std::max(n, 0));
+    end = std::clamp(end < 0 ? n + end : end, 0, std::max(n, 0));
+    end = std::max(begin, end);
+    const int d = offsets_.back();
+    EdgeWorkspace work(robots_.size());
+    EdgeStats unused;
+    for (std::size_t r = 0; r < robots_.size(); ++r)
+      work.paths[r].resize(16, std::vector<double>(robots_[r]->numJoints()));
+    py::gil_scoped_release release;
+    return check_edge_grid(a.data(), b.data(), d, n, begin, end, endpoints,
+                           packing, [&](const double *samples, int rows) {
+      for (int k = 0; k < rows; ++k)
+        if (!in_bounds(samples + k * d)) return false;
+      if (!vamp_ || !optimized_) {
+        for (int k = 0; k < rows; ++k) {
+          auto q = unpack(samples + k * d);
+          if (!checker_.isValidComposite(robots_, q) || !extras_.valid(robots_, q))
+            return false;
+        }
+        return true;
+      }
+      bool accepted = true;
+      for (int offset = 0; offset < rows; offset += int(width)) {
+        int count = std::min(int(width), rows - offset);
+        work.rows.resize(count);
+        std::iota(work.rows.begin(), work.rows.end(), 0);
+        for (std::size_t r = 0; r < robots_.size(); ++r) {
+          work.paths[r].resize(count);
+          for (int k = 0; k < count; ++k) {
+            auto &q = work.paths[r][k];
+            q.resize(robots_[r]->numJoints());
+            std::copy_n(samples + (offset + k) * d + offsets_[r], q.size(), q.begin());
+          }
+          if (!checker_.isRobotPathValid(*robots_[r], work.paths[r])) {
+            accepted = false;
+            if (early_exit) return false;
+          }
+        }
+        if (!edge_pairs<3, false>(robots_, work, unused)) {
+          accepted = false;
+          if (early_exit) return false;
+        }
+        if (!extras_.empty())
+          for (int k = 0; k < count; ++k)
+            if (!extras_.valid(robots_, unpack(samples + (offset + k) * d))) {
+              accepted = false;
+              if (early_exit) return false;
+            }
+      }
+      return accepted;
+    });
+  }
   void set_primitives(const std::vector<int> &owners,
                       const std::vector<std::string> &links,
                       const std::vector<int> &kinds, const Array &sizes,
@@ -503,7 +589,30 @@ PYBIND11_MODULE(_collision, m) {
       .def("group_valid", &Scene::group_valid, py::arg("q"), py::arg("group"),
            py::arg("include_other_robots") = true)
       .def("motion_valid", &Scene::motion_valid)
-      .def("batch_valid", &Scene::batch_valid)
+      .def("initial", [](const Scene &) { return py::none(); })
+      .def("state_valid", &Scene::valid, py::arg("q"))
+      .def("state_valid", [](const Scene &scene, const Array &q, const py::object &mode) {
+        Scene::check_query(mode, 0.);
+        return scene.valid(q);
+      }, py::arg("q"), py::arg("mode"))
+      .def("state_valid", &Scene::state_valid, py::arg("q"), py::arg("mode"),
+           py::arg("group") = std::vector<int>{}, py::arg("tolerance") = 0.)
+      .def("batch_valid", &Scene::query_batch, py::arg("qs"), py::arg("mode") = py::none(),
+           py::arg("group") = std::vector<int>{}, py::arg("simd") = true, py::arg("tolerance") = 0.)
+      .def("batch_edge_valid", [](Scene &scene, Array from, Array to,
+                                    py::object mode, py::array_t<int, py::array::c_style> counts,
+                                    bool endpoints, double tolerance, const std::string &packing) {
+        return comotion_python::check_edge_batch(from, to, counts,
+          [&](Array a, Array b, int n) {
+            return scene.edge_valid(a, b, mode, n, 0, n, endpoints, tolerance, packing, true);
+          });
+      }, py::arg("from_q"), py::arg("to_q"), py::arg("mode"), py::arg("counts"),
+         py::arg("include_endpoints") = false, py::arg("tolerance") = 0.,
+         py::arg("packing") = "binary")
+      .def("edge_valid", &Scene::edge_valid, py::arg("from_q"), py::arg("to_q"),
+           py::arg("mode"), py::arg("n"), py::arg("begin"), py::arg("end"),
+           py::arg("include_endpoints"), py::arg("tolerance") = 0.,
+           py::arg("packing") = "binary", py::arg("early_exit") = true)
       .def("set_optimized", &Scene::set_optimized)
       .def("set_packed_world", &Scene::set_packed_world)
       .def("set_primitives", &Scene::set_primitives)

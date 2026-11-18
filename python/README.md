@@ -7,6 +7,66 @@ The primitive scene is an additional runtime backend, not an implementation of
 CoMotion's planning algorithms. Each scene is mutable and must not be queried
 concurrently from multiple threads.
 
+## Common scene interface
+
+Use `Scene(definition, implementation="generic")` for an articulated primitive
+scene, or `implementation="generated"` for the supported generated Panda model.
+Both consume the same frame/joint/shape definition. Selection is explicit:
+there is no automatic fallback, mesh approximation or sphere substitution.
+An incompatible generated model, attachment transition or nonzero tolerance
+raises an error. Generic scenes retain support for rigid attachments and
+sphere, capsule, cylinder and sharp-box collision geometry.
+
+```python
+import numpy as np
+from comotion import Scene, import_robot_scene, load_builtin, resource_directory
+
+source = load_builtin("cage", 4)
+assets = resource_directory() / "panda"
+definition = import_robot_scene(
+    assets / "panda_spherized.urdf", assets / "panda.srdf",
+    source["robot_bases"], source["obstacles"],
+    start_q=np.asarray(source["tasks"][0]["starts"]).ravel(),
+)
+scene = Scene(definition, implementation="generated")
+mode = scene.initial()
+q = np.asarray(definition["start_q"])
+valid = scene.state_valid(q, mode)
+mask = scene.batch_valid(np.stack([q, q]), mode)
+valid, last_submitted, count = scene.edge_valid(q, q, mode, 33, 0, 33, True)
+mask = scene.batch_edge_valid(
+    q[None, :], q[None, :], mode, np.array([33], dtype=np.int32), True,
+)
+```
+
+The importer preserves collision geometry and exclusions; unsupported URDF
+joints and collision meshes raise `UnsupportedScene`. Generated-model admission
+checks the supplied definition against the supported model's kinematics,
+spheres, limits and pair exclusions. Modified geometry remains usable with the
+generic implementation if its primitives are supported. Matching currently
+requires the importer's Panda frame/joint layout; arbitrary equivalent frame
+layouts are not recognized as generated models.
+
+Definitions are copied at construction; `scene.definition` returns a copy.
+`poses(q, mode)` and `info(mode)` inspect that same geometry. Generated scenes
+prepare generic FK lazily for inspection only; collision queries do not run
+both engines. `transition()` is available for generic attachment modes.
+`runtime`, `spheres` and `fcl` are retained as reference implementations for the
+same admitted static Panda scenes. The low-level `RobotScene` and
+`PrimitiveScene` APIs remain available for compatibility; use `Scene` to obtain
+the definition compatibility checks.
+
+State and edge calls bind directly to native methods. `state_valid(q)` without
+a mode checks the initial geometry at zero tolerance. An edge uses
+`q(i) = start + i/(n-1) * (end-start)`. `begin`/`end` select positions in the
+binary traversal before endpoint removal; partial requests use binary order
+even when full edges use rake or linear order. Edge batches use native sequential
+execution with SIMD within edges, not a worker pool or cross-edge SIMD packing.
+The returned `last_submitted` is not a certified last-valid state. A nonempty
+`group` on state/batch queries checks that group's isolated feasibility, including
+its internal collisions, while omitting other robots. An empty group means the
+full scene.
+
 ## Install
 
 Install a C++17 compiler, CMake, Eigen3, libccd, FCL (which also pulls in octomap)

@@ -1,4 +1,6 @@
 #include "primitive_scene.h"
+#include "edge_grid.h"
+#include "edge_batch.h"
 
 namespace comotion_python::primitive {
 std::tuple<bool, int, int>
@@ -6,79 +8,21 @@ Scene::edge(Array from, Array to, std::shared_ptr<Mode> m, int n, int begin,
             int end, bool endpoints, double tolerance,
             const std::string &packing, bool early_exit) {
   check(m);
-  if (packing != "binary" && packing != "rake" && packing != "linear")
-    throw std::invalid_argument("Unknown edge packing");
   int d = joints.size();
-  if (from.ndim() != 1 || to.ndim() != 1 || from.size() != d ||
-      to.size() != d || n < 2)
-    throw std::invalid_argument("Invalid edge dimensions or sample count");
+  if (from.ndim() != 1 || to.ndim() != 1 || from.size() != d || to.size() != d)
+    throw std::invalid_argument("Invalid edge dimensions");
   if (!std::isfinite(tolerance) || tolerance < 0)
     throw std::invalid_argument("Invalid collision tolerance");
-  begin = std::clamp(begin < 0 ? n + begin : begin, 0, n);
-  end = std::clamp(end < 0 ? n + end : end, 0, n);
-  if (begin >= end)
-    return {true, -1, 0};
-  std::vector<std::pair<int, int>> queue;
-  queue.reserve(end + 1);
-  queue.emplace_back(0, n - 1);
-  Array samples({16, d});
-  int rows = 0, last = -1, checked = 0;
-  auto flush = [&]() {
-    Array chunk({rows, d}, samples.data(), samples);
-    auto valid =
-        batch_impl(chunk, m, {}, true, tolerance, py::none(), early_exit);
-    checked += rows;
-    for (int i = 0; i < rows; ++i)
-      if (!valid.data()[i])
-        return false;
-    rows = 0;
-    return true;
-  };
-  const double *a = from.data(), *b = to.data();
-  auto append = [&](int mid) {
-    double t = double(mid) / (n - 1);
-    for (int j = 0; j < d; ++j) {
-      // Match NumPy's separate multiply and add rather than a fused FMA.
-      volatile double offset = t * (b[j] - a[j]);
-      samples.mutable_data()[rows * d + j] = a[j] + offset;
-    }
-    last = mid;
-    ++rows;
-    return rows < 16 || flush();
-  };
-  // Partial checks index the binary order, including their resume offset.
-  if (packing == "binary" || begin != 0 || end != n) {
-    for (int pos = 0; pos < end; ++pos) {
-      auto [lo, hi] = queue[pos];
-      int mid = (lo + hi) / 2;
-      if (lo < mid)
-        queue.emplace_back(lo, mid - 1);
-      if (mid < hi)
-        queue.emplace_back(mid + 1, hi);
-      if (pos < begin || (!endpoints && (mid == 0 || mid == n - 1)))
-        continue;
-      if (!append(mid))
-        return {false, last, checked};
-    }
-  } else {
-    auto order = packing == "rake" ? comotion::VampBatchPacking::Rake
-                                   : comotion::VampBatchPacking::Linear;
-    for (const auto &pack :
-         comotion::detail::makeVampPackingLayouts(0, n, order)) {
-      for (size_t lane = 0; lane < pack.lanes; ++lane) {
-        int i = pack.timesteps[lane];
-        if ((!endpoints && (i == 0 || i == n - 1)))
-          continue;
-        if (!append(i))
-          return {false, last, checked};
-      }
-      if (rows && !flush())
-        return {false, last, checked};
-    }
-  }
-  if (rows && !flush())
-    return {false, last, checked};
-  return {true, last, checked};
+  // Retain the low-level primitive API's historical slice normalization.
+  begin = std::clamp(begin < 0 ? n + begin : begin, 0, std::max(n, 0));
+  end = std::clamp(end < 0 ? n + end : end, 0, std::max(n, 0));
+  end = std::max(begin, end);
+  return check_edge_grid(from.data(), to.data(), d, n, begin, end, endpoints,
+                         packing, [&](const double *samples, int rows) {
+    Array chunk({rows, d}, samples, py::none());
+    auto valid = batch_impl(chunk, m, {}, true, tolerance, py::none(), early_exit);
+    return std::all_of(valid.data(), valid.data() + rows, [](bool v) { return v; });
+  });
 }
 
 py::array_t<bool> Scene::batch(Array qs, std::shared_ptr<Mode> m,
@@ -282,8 +226,21 @@ PYBIND11_MODULE(_primitive, m) {
       .def("transition", &Scene::transition, py::keep_alive<0, 1>())
       .def("poses", &Scene::poses)
       .def("info", &Scene::info)
+      .def("state_valid", [](Scene &scene, Array q) {
+        return scene.state(q, scene.initial(), {}, 0.);
+      }, py::arg("q"))
       .def("state_valid", &Scene::state, py::arg("q"), py::arg("mode"),
            py::arg("group") = std::vector<int>{}, py::arg("tolerance") = 0.)
+      .def("batch_edge_valid", [](Scene &scene, Array from, Array to,
+                                    std::shared_ptr<Mode> mode, py::array_t<int, py::array::c_style> counts,
+                                    bool endpoints, double tolerance, const std::string &packing) {
+        return comotion_python::check_edge_batch(from, to, counts,
+          [&](Array a, Array b, int n) {
+            return scene.edge(a, b, mode, n, 0, n, endpoints, tolerance, packing, true);
+          });
+      }, py::arg("from_q"), py::arg("to_q"), py::arg("mode"), py::arg("counts"),
+         py::arg("include_endpoints") = false, py::arg("tolerance") = 0.,
+         py::arg("packing") = "binary")
       .def("edge_valid", &Scene::edge, py::arg("from_q"), py::arg("to_q"),
            py::arg("mode"), py::arg("n"), py::arg("begin"), py::arg("end"),
            py::arg("include_endpoints"), py::arg("tolerance") = 0.,
